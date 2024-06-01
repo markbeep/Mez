@@ -27,10 +27,11 @@ pub fn main() !void {
     var env = try std.process.getEnvMap(allocator);
     defer env.deinit();
     const api_port = try std.fmt.parseUnsigned(u16, env.get("API_PORT") orelse "5882", 10);
-    const redis_port = try std.fmt.parseUnsigned(u16, env.get("REDIS_PORT") orelse "6371", 10);
+    const redis_port = try std.fmt.parseUnsigned(u16, env.get("REDIS_PORT") orelse "6379", 10);
     const redis_host = env.get("REDIS_HOST") orelse "127.0.0.1";
 
     var redis = db.RedisConnection.init(allocator);
+    defer redis.deinit();
     const redis_host_z = try allocator.dupeZ(u8, redis_host);
     defer allocator.free(redis_host_z);
     try redis.connect(redis_host_z, redis_port);
@@ -81,23 +82,35 @@ fn errorHandler(_: Context, req: *httpz.Request, res: *httpz.Response, err: anye
         .int("status", res.status).log();
 }
 
-fn postUser(_: Context, _: *httpz.Request, res: *httpz.Response) !void {
+fn postUser(ctx: Context, _: *httpz.Request, res: *httpz.Response) !void {
     const id = uuid.v4();
-    res.status = 200;
-    try res.json(.{ .id = id }, .{});
+    const user = db.User{ .id = id };
+    ctx.cache.redis.setUser(user) catch |err| {
+        if (err == db.RedisConnection.errors.FailedToSet) {
+            res.status = 400;
+            return;
+        }
+        return err;
+    };
+    res.status = 201;
+    try res.json(user, .{});
 }
 
 fn getUser(ctx: Context, req: *httpz.Request, res: *httpz.Response) !void {
-    // _ = ctx;
-    _ = try ctx.cache.redis.getUser(uuid.v4());
     const id = req.param("id") orelse "";
     const parsed_id = uuid.parse(id) catch null;
-    if (parsed_id != null) {
-        // logz.info().string("id", id).log();
-        res.status = 200;
-    } else {
+    if (parsed_id == null) {
         res.status = 400;
         res.body = "Invalid id";
         logz.err().string("id", id).log();
+        return;
+    }
+    const user = try ctx.cache.redis.getUser(id);
+    if (user == null) {
+        res.status = 404;
+        res.body = "User not found";
+    } else {
+        res.status = 200;
+        try res.json(user, .{});
     }
 }

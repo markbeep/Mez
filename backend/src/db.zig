@@ -9,7 +9,10 @@ const uuid = @import("zul").UUID;
 
 pub const User = struct {
     id: uuid,
-    name: []const u8,
+};
+
+const UnserializedUser = struct {
+    id: []const u8,
 };
 
 pub const DbConnection = union(enum) {
@@ -20,9 +23,15 @@ pub const DbConnection = union(enum) {
         }
     }
 
-    pub fn getUser(self: *DbConnection, id: uuid) !void {
-        switch (self.*) {
+    pub fn getUser(self: DbConnection, id: []const u8) !void {
+        switch (self) {
             inline else => return self.getUser(id),
+        }
+    }
+
+    pub fn setUser(self: DbConnection, user: User) !void {
+        switch (self) {
+            inline else => return self.setUser(user),
         }
     }
 };
@@ -33,11 +42,34 @@ pub const RedisConnection = struct {
 
     pub const errors = error{
         FailedToConnect,
-        FailedToGET,
+        FailedToGet,
+        FailedToSet,
     };
 
     pub fn init(allocator: Allocator) RedisConnection {
         return RedisConnection{ ._allocator = allocator };
+    }
+
+    pub fn deinit(self: RedisConnection) void {
+        if (self._conn != 0) {
+            hiredis.redisFree(self._conn);
+        }
+    }
+
+    pub fn connect(self: *RedisConnection, host: [:0]const u8, port: u16) !void {
+        if (self._conn == 0) {
+            self._conn = hiredis.redisConnect(host, port);
+        } else {
+            _ = hiredis.redisReconnect(self._conn);
+        }
+        if (self._conn == null or self._conn.*.err != 0) {
+            self.logRedisError();
+            return errors.FailedToConnect;
+        }
+    }
+
+    fn reconnect(self: RedisConnection) void {
+        _ = hiredis.redisReconnect(self._conn);
     }
 
     fn logRedisError(self: RedisConnection) void {
@@ -45,43 +77,47 @@ pub const RedisConnection = struct {
         logz.err()
             .string("database", "redis")
             .string("errmsg", &self._conn.*.errstr).log();
-    }
-
-    pub fn connect(self: *RedisConnection, host: [:0]const u8, port: u16) !void {
-        self._conn = hiredis.redisConnect(host, port);
-        if (self._conn == null or self._conn.*.err != 0) {
-            self.logRedisError();
-            return errors.FailedToConnect;
+        if (self._conn.*.err != 0) {
+            self.reconnect();
         }
     }
 
-    /// Executes redis GET command with the given key and returns a
-    /// caller owned string.
-    fn redisGet(self: *RedisConnection, allocator: Allocator, key: anytype) ![]u8 {
-        assert(self._conn != 0);
+    pub fn getUser(self: RedisConnection, id: []const u8) !?User {
+        // ensure string is zero padded
+        const user_id = try self._allocator.dupeZ(u8, id);
+        defer self._allocator.free(user_id);
 
-        var string = std.ArrayList(u8).init(allocator);
-        errdefer string.deinit();
-        try std.json.stringify(key, .{}, string.writer());
-
-        std.debug.print("str = {s}\n", .{string.items});
-        const _reply = hiredis.redisCommand(self._conn, "GET %s", string.items.ptr) orelse {
+        const _reply = hiredis.redisCommand(self._conn, "GET user:%s", user_id.ptr) orelse {
             self.logRedisError();
-            return errors.FailedToConnect;
+            return errors.FailedToGet;
         };
-        var redisReply: *hiredis.struct_redisReply = @ptrCast(@alignCast(_reply));
-        defer hiredis.freeReplyObject(redisReply);
+        const redis_reply: *hiredis.struct_redisReply = @ptrCast(@alignCast(_reply));
+        defer hiredis.freeReplyObject(redis_reply);
 
-        // Write response string into previous array
-        string.clearRetainingCapacity();
-        try string.ensureTotalCapacity(redisReply.len);
-        string.appendSliceAssumeCapacity(redisReply.str[0..redisReply.len]);
-        return try string.toOwnedSlice();
+        if (redis_reply.type != hiredis.REDIS_REPLY_STRING) return null;
+
+        const parsed_user = try std.json.parseFromSlice(UnserializedUser, self._allocator, redis_reply.str[0..redis_reply.len], .{});
+        defer parsed_user.deinit();
+
+        return User{
+            .id = try uuid.parse(parsed_user.value.id),
+        };
     }
 
-    pub fn getUser(self: *RedisConnection, id: uuid) !void {
-        _ = id;
-        const user = try self.redisGet(self._allocator, "user:1");
-        logz.info().string("user", user).log();
+    pub fn setUser(self: RedisConnection, user: User) !void {
+        var json_user = std.ArrayList(u8).init(self._allocator);
+        defer json_user.deinit();
+        try std.json.stringify(user, .{}, json_user.writer());
+        try json_user.append(0);
+
+        var id: [37]u8 = undefined;
+        @memcpy(id[0..36], &user.id.toHex(.lower));
+        id[36] = 0;
+
+        // important for the strings to be null terminated
+        _ = hiredis.redisCommand(self._conn, "SET user:%s %s", &id, json_user.items.ptr) orelse {
+            self.logRedisError();
+            return errors.FailedToSet;
+        };
     }
 };
