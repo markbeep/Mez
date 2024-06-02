@@ -18,9 +18,9 @@
       in
       {
         packages = rec {
-          default = mezzage;
-          mezzage = pkgs.stdenv.mkDerivation {
-            name = "Mezzage";
+          default = Mez;
+          Mez = pkgs.stdenv.mkDerivation {
+            name = "Mez";
             src = ./.;
 
             buildInputs = [

@@ -7,6 +7,7 @@ const db = @import("db.zig");
 const Context = struct {
     // database: db.DbConnection, // TODO: add db for persistence
     cache: *db.DbConnection,
+    allocator: std.mem.Allocator,
 };
 
 pub fn main() !void {
@@ -30,7 +31,7 @@ pub fn main() !void {
     const redis_port = try std.fmt.parseUnsigned(u16, env.get("REDIS_PORT") orelse "6379", 10);
     const redis_host = env.get("REDIS_HOST") orelse "127.0.0.1";
 
-    var redis = db.RedisConnection.init(allocator);
+    var redis = db.RedisConnection.init();
     defer redis.deinit();
     const redis_host_z = try allocator.dupeZ(u8, redis_host);
     defer allocator.free(redis_host_z);
@@ -41,14 +42,14 @@ pub fn main() !void {
         .int("port", redis_port).log();
 
     var dbConn = db.DbConnection{ .redis = redis };
-    const context = Context{ .cache = &dbConn };
+    const context = Context{ .cache = &dbConn, .allocator = allocator };
     var server = try httpz.ServerCtx(Context, Context).init(
         allocator,
         .{ .port = api_port },
         context,
     );
 
-    server.dispatcher(logDispatcher);
+    server.dispatcher(dispatcher);
     server.errorHandler(errorHandler);
 
     var router = server.router();
@@ -60,10 +61,17 @@ pub fn main() !void {
     try server.listen();
 }
 
-fn logDispatcher(ctx: Context, action: httpz.Action(Context), req: *httpz.Request, res: *httpz.Response) !void {
+fn dispatcher(ctx: Context, action: httpz.Action(Context), req: *httpz.Request, res: *httpz.Response) !void {
+    // create an arena allocator that gets thrown away after each request
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    var arena_ctx = ctx;
+    arena_ctx.allocator = arena.allocator();
+
     var timer = try std.time.Timer.start();
-    try action(ctx, req, res);
+    try action(arena_ctx, req, res);
     const elapsed = timer.read();
+
     logz.info()
         .string("path", req.url.path)
         .string("method", @tagName(req.method))
@@ -82,10 +90,21 @@ fn errorHandler(_: Context, req: *httpz.Request, res: *httpz.Response, err: anye
         .int("status", res.status).log();
 }
 
-fn postUser(ctx: Context, _: *httpz.Request, res: *httpz.Response) !void {
+fn postUser(ctx: Context, req: *httpz.Request, res: *httpz.Response) !void {
+    const body = req.body() orelse {
+        res.status = 400;
+        res.body = "Missing body";
+        return;
+    };
+    const json = std.json.parseFromSliceLeaky(db.CreateUserRequest, ctx.allocator, body, .{}) catch {
+        res.status = 400;
+        res.body = "Invalid body";
+        return;
+    };
+
     const id = uuid.v4();
-    const user = db.User{ .id = id };
-    ctx.cache.redis.setUser(user) catch |err| {
+    const user = db.User{ .id = id, .username = json.username };
+    ctx.cache.redis.setUser(ctx.allocator, user) catch |err| {
         if (err == db.RedisConnection.errors.FailedToSet) {
             res.status = 400;
             return;
@@ -105,11 +124,12 @@ fn getUser(ctx: Context, req: *httpz.Request, res: *httpz.Response) !void {
         logz.err().string("id", id).log();
         return;
     }
-    const user = try ctx.cache.redis.getUser(id);
+    const user = try ctx.cache.getUser(ctx.allocator, id);
     if (user == null) {
         res.status = 404;
         res.body = "User not found";
     } else {
+        defer ctx.allocator.free(user.?.username);
         res.status = 200;
         try res.json(user, .{});
     }

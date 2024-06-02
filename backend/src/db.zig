@@ -9,10 +9,16 @@ const uuid = @import("zul").UUID;
 
 pub const User = struct {
     id: uuid,
+    username: []const u8,
 };
 
 const UnserializedUser = struct {
     id: []const u8,
+    username: []const u8,
+};
+
+pub const CreateUserRequest = struct {
+    username: []const u8,
 };
 
 pub const DbConnection = union(enum) {
@@ -23,22 +29,21 @@ pub const DbConnection = union(enum) {
         }
     }
 
-    pub fn getUser(self: DbConnection, id: []const u8) !void {
+    pub fn getUser(self: DbConnection, allocator: Allocator, id: []const u8) !?User {
         switch (self) {
-            inline else => return self.getUser(id),
+            inline else => |case| return case.getUser(allocator, id),
         }
     }
 
-    pub fn setUser(self: DbConnection, user: User) !void {
+    pub fn setUser(self: DbConnection, allocator: Allocator, user: User) !void {
         switch (self) {
-            inline else => return self.setUser(user),
+            inline else => |case| return case.setUser(allocator, user),
         }
     }
 };
 
 pub const RedisConnection = struct {
     _conn: [*c]hiredis.struct_redisContext = 0,
-    _allocator: Allocator,
 
     pub const errors = error{
         FailedToConnect,
@@ -46,8 +51,8 @@ pub const RedisConnection = struct {
         FailedToSet,
     };
 
-    pub fn init(allocator: Allocator) RedisConnection {
-        return RedisConnection{ ._allocator = allocator };
+    pub fn init() RedisConnection {
+        return RedisConnection{};
     }
 
     pub fn deinit(self: RedisConnection) void {
@@ -82,10 +87,10 @@ pub const RedisConnection = struct {
         }
     }
 
-    pub fn getUser(self: RedisConnection, id: []const u8) !?User {
+    pub fn getUser(self: RedisConnection, allocator: Allocator, id: []const u8) !?User {
         // ensure string is zero padded
-        const user_id = try self._allocator.dupeZ(u8, id);
-        defer self._allocator.free(user_id);
+        const user_id = try allocator.dupeZ(u8, id);
+        defer allocator.free(user_id);
 
         const _reply = hiredis.redisCommand(self._conn, "GET user:%s", user_id.ptr) orelse {
             self.logRedisError();
@@ -96,16 +101,17 @@ pub const RedisConnection = struct {
 
         if (redis_reply.type != hiredis.REDIS_REPLY_STRING) return null;
 
-        const parsed_user = try std.json.parseFromSlice(UnserializedUser, self._allocator, redis_reply.str[0..redis_reply.len], .{});
+        const parsed_user = try std.json.parseFromSlice(UnserializedUser, allocator, redis_reply.str[0..redis_reply.len], .{});
         defer parsed_user.deinit();
 
         return User{
             .id = try uuid.parse(parsed_user.value.id),
+            .username = try allocator.dupe(u8, parsed_user.value.username),
         };
     }
 
-    pub fn setUser(self: RedisConnection, user: User) !void {
-        var json_user = std.ArrayList(u8).init(self._allocator);
+    pub fn setUser(self: RedisConnection, allocator: Allocator, user: User) !void {
+        var json_user = std.ArrayList(u8).init(allocator);
         defer json_user.deinit();
         try std.json.stringify(user, .{}, json_user.writer());
         try json_user.append(0);
