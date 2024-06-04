@@ -6,20 +6,7 @@ const hiredis = @cImport({
 });
 const logz = @import("logz");
 const uuid = @import("zul").UUID;
-
-pub const User = struct {
-    id: uuid,
-    username: []const u8,
-};
-
-const UnserializedUser = struct {
-    id: []const u8,
-    username: []const u8,
-};
-
-pub const CreateUserRequest = struct {
-    username: []const u8,
-};
+const interface = @import("interface.zig");
 
 pub const DbConnection = union(enum) {
     redis: RedisConnection,
@@ -29,13 +16,13 @@ pub const DbConnection = union(enum) {
         }
     }
 
-    pub fn getUser(self: DbConnection, allocator: Allocator, id: []const u8) !?User {
+    pub fn getUser(self: DbConnection, allocator: Allocator, id: []const u8) !?interface.User {
         switch (self) {
             inline else => |case| return case.getUser(allocator, id),
         }
     }
 
-    pub fn setUser(self: DbConnection, allocator: Allocator, user: User) !void {
+    pub fn setUser(self: DbConnection, allocator: Allocator, user: interface.User) !void {
         switch (self) {
             inline else => |case| return case.setUser(allocator, user),
         }
@@ -87,41 +74,47 @@ pub const RedisConnection = struct {
         }
     }
 
-    pub fn getUser(self: RedisConnection, allocator: Allocator, id: []const u8) !?User {
+    pub fn getUser(self: RedisConnection, allocator: Allocator, id: []const u8) !?interface.User {
         // ensure string is zero padded
         const user_id = try allocator.dupeZ(u8, id);
         defer allocator.free(user_id);
 
-        const _reply = hiredis.redisCommand(self._conn, "GET user:%s", user_id.ptr) orelse {
+        const _reply = hiredis.redisCommand(self._conn, "HGETALL user:%s", user_id.ptr) orelse {
             self.logRedisError();
             return errors.FailedToGet;
         };
         const redis_reply: *hiredis.struct_redisReply = @ptrCast(@alignCast(_reply));
         defer hiredis.freeReplyObject(redis_reply);
 
-        if (redis_reply.type != hiredis.REDIS_REPLY_STRING) return null;
+        if (redis_reply.type != hiredis.REDIS_REPLY_ARRAY or redis_reply.elements == 0) return null;
 
-        const parsed_user = try std.json.parseFromSlice(UnserializedUser, allocator, redis_reply.str[0..redis_reply.len], .{});
-        defer parsed_user.deinit();
-
-        return User{
-            .id = try uuid.parse(parsed_user.value.id),
-            .username = try allocator.dupe(u8, parsed_user.value.username),
+        var user = interface.User{
+            .id = try uuid.parse(id),
+            .username = undefined,
         };
+
+        var i: usize = 0;
+        std.debug.print("reply.elements = {}\n", .{redis_reply.elements});
+        while (i < redis_reply.elements) : (i += 2) {
+            const sub_reply: *hiredis.struct_redisReply = @ptrCast(@alignCast(redis_reply.element[i + 1]));
+            std.debug.print("sub_reply = {s}\n", .{sub_reply.str[0..sub_reply.len]});
+            if (sub_reply.type == hiredis.REDIS_REPLY_STRING and std.mem.eql(u8, "username", sub_reply.str[0..sub_reply.len])) {
+                user.username = try allocator.dupe(u8, sub_reply.str[0..sub_reply.len]);
+            }
+        }
+
+        return user;
     }
 
-    pub fn setUser(self: RedisConnection, allocator: Allocator, user: User) !void {
-        var json_user = std.ArrayList(u8).init(allocator);
-        defer json_user.deinit();
-        try std.json.stringify(user, .{}, json_user.writer());
-        try json_user.append(0);
-
+    pub fn setUser(self: RedisConnection, allocator: Allocator, user: interface.User) !void {
+        // important for the strings to be null terminated
         var id: [37]u8 = undefined;
         @memcpy(id[0..36], &user.id.toHex(.lower));
         id[36] = 0;
 
-        // important for the strings to be null terminated
-        _ = hiredis.redisCommand(self._conn, "SET user:%s %s", &id, json_user.items.ptr) orelse {
+        const username = try allocator.dupeZ(u8, user.username);
+
+        _ = hiredis.redisCommand(self._conn, "HSET user:%s username %s", &id, username.ptr) orelse {
             self.logRedisError();
             return errors.FailedToSet;
         };

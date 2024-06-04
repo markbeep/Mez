@@ -3,6 +3,7 @@ const httpz = @import("httpz");
 const logz = @import("logz");
 const uuid = @import("zul").UUID;
 const db = @import("db.zig");
+const interface = @import("interface.zig");
 
 const Context = struct {
     // database: db.DbConnection, // TODO: add db for persistence
@@ -96,14 +97,14 @@ fn postUser(ctx: Context, req: *httpz.Request, res: *httpz.Response) !void {
         res.body = "Missing body";
         return;
     };
-    const json = std.json.parseFromSliceLeaky(db.CreateUserRequest, ctx.allocator, body, .{}) catch {
+    const json = std.json.parseFromSliceLeaky(interface.CreateUserRequest, ctx.allocator, body, .{}) catch {
         res.status = 400;
         res.body = "Invalid body";
         return;
     };
 
     const id = uuid.v4();
-    const user = db.User{ .id = id, .username = json.username };
+    const user = interface.User{ .id = id, .username = json.username };
     ctx.cache.redis.setUser(ctx.allocator, user) catch |err| {
         if (err == db.RedisConnection.errors.FailedToSet) {
             res.status = 400;
